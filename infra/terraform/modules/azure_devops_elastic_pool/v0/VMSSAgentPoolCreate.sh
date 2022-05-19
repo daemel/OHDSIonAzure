@@ -26,6 +26,7 @@ generate_request_body()
 EOF
 }
 
+# create b64 encoded PAT
 B64_PAT=$(printf "%s"":$PAT" | base64)
 
 createVMSSJson=$(curl -X POST "$ADO_ORG_SERVICE_URL/_apis/distributedtask/elasticpools?api-version=6.1-preview.1&poolName=$POOLNAME&authorizeAllPipelines=false&autoProvisionProjectPools=false&projectId=$PROJECT_ID" \

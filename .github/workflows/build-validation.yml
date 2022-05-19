@@ -4,6 +4,7 @@
 ## GitHub Actions ###############
 ## lint #########################
 ## Check Terraform ##############
+## Run CI Terraform #############
 ## Test SQL #####################
 #################################
 name: Build Validation
@@ -197,19 +198,6 @@ jobs:
           echo "***** Validating: infra/terraform/omop *****"
           terraform -chdir=infra/terraform/omop validate
 
-      # - name: Terraform OMOP Plan
-      #   id: terraform_omop_plan
-      #   if: ${{ steps.filter.outputs.terraform == 'true' }}
-      #   env:
-      #     ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
-      #     ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
-      #     ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
-      #     ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-      #   run: |
-      #     # TODO: Revisit after setting az login context
-      #     # echo "***** Checking plan for infra/terraform/omop *****"
-      #     # terraform -chdir=infra/terraform/omop plan
-
       - name: Add Terraform Plan Comment
         id: comment
         uses: actions/github-script@v3
@@ -259,6 +247,181 @@ jobs:
                 body: output
               })
             }
+
+  run_ci_terraform:
+    needs: check_terraform # job dependency
+    # Name the Job
+    name: Run CI Terraform
+    # Set the agent to run on
+    runs-on: ubuntu-latest
+    environment: ci-validation
+
+    ##################
+    # Load all steps #
+    ##################
+    steps:
+      ##########################
+      # Checkout the code base #
+      ##########################
+      - name: Checkout Code
+        uses: actions/checkout@v2
+        with:
+          # Full git history is needed to get a proper list of changed files within `super-linter`
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set CI Validation Context
+        id: set_ci_validation_context
+        run: |
+          sha=${{ github.sha }}
+          run_id=${{ github.run_id }}
+          prefix="ci${sha::4}"
+          environment=${run_id::4}
+
+          ado_project_url="https://dev.azure.com/${{ secrets.ADO_ORGANIZATION_NAME }}/$prefix-$environment-OHDSIonAzure"
+
+          # Set environment variables for use with ci validation
+          # shellcheck disable=SC2086,SC2129
+          echo "prefix=$prefix" >> $GITHUB_ENV
+
+          # shellcheck disable=SC2086,SC2129
+          echo "environment=$environment" >> $GITHUB_ENV
+
+          # shellcheck disable=SC2086,SC2129
+          echo "ado_project_url=$ado_project_url" >> $GITHUB_ENV
+
+      # find all terraform folders and run validate to catch
+      # configuration errors
+      - name: Terraform Bootstrap Init
+        id: terraform_bootstrap_init
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_ACCESS_KEY: ${{ secrets.BOOTSTRAP_TF_STATE_STORAGE_ACCOUNT_KEY }}
+        run: |
+          az login --service-principal -u "${{ secrets.ARM_CLIENT_ID }}" -p "${{ secrets.ARM_CLIENT_SECRET }}" --tenant "${{ secrets.ARM_TENANT_ID }}"
+
+          CONTAINER_NAME="$prefix-$environment-tfstate"
+
+          # Create Container for TF state
+          az storage container create --name "$CONTAINER_NAME" --account-name ${{ secrets.BOOTSTRAP_TF_STATE_STORAGE_ACCOUNT }}
+
+          echo "***** Initialize: infra/terraform/bootstrap *****"
+          cd infra/terraform/bootstrap
+          terraform init \
+            -force-copy \
+            -backend-config='resource_group_name=${{ secrets.BOOTSTRAP_TF_STATE_RG }}' \
+            -backend-config='storage_account_name=${{ secrets.BOOTSTRAP_TF_STATE_STORAGE_ACCOUNT }}' \
+            -backend-config="container_name=$CONTAINER_NAME" \
+            -backend-config='key=${{ secrets.BOOTSTRAP_TF_STATE_FILE_NAME }}'
+          cd -
+
+      - name: Terraform Bootstrap Apply
+        id: terraform_bootstrap_apply
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_ACCESS_KEY: ${{ secrets.BOOTSTRAP_TF_STATE_STORAGE_ACCOUNT_KEY }}
+        run: |
+          az login --service-principal -u "${{ secrets.ARM_CLIENT_ID }}" -p "${{ secrets.ARM_CLIENT_SECRET }}" --tenant "${{ secrets.ARM_TENANT_ID }}"
+
+          cd infra/terraform/bootstrap
+          terraform apply -auto-approve \
+            -var 'client_object_id=${{ secrets.ARM_CLIENT_OBJECT_ID }}' \
+            -var "prefix=$prefix" \
+            -var "environment=$environment" \
+            -var 'omop_password=${{ secrets.OMOP_PASSWORD }}' \
+            -var 'ado_pat=${{ secrets.ADO_PAT }}' \
+            -var 'admin_user_jumpbox=${{ secrets.ADMIN_USER_JUMPBOX }}' \
+            -var 'admin_password_jumpbox=${{ secrets.ADMIN_PASSWORD_JUMPBOX }}' \
+            -var 'admin_user=${{ secrets.ADMIN_USER }}' \
+            -var 'admin_password=${{ secrets.ADMIN_PASSWORD }}'
+          cd -
+
+      # find all terraform folders and run validate to catch
+      # configuration errors
+      - name: Terraform OMOP Init
+        id: terraform_omop_init
+        run: |
+          echo "***** Validating: infra/terraform/omop *****"
+          terraform -chdir=infra/terraform/omop init -backend=false
+
+      - name: Terraform OMOP Validate
+        id: terraform_omop_validate
+        run: |
+          echo "***** Validating: infra/terraform/omop *****"
+          terraform -chdir=infra/terraform/omop validate
+
+      # Need to check if the agent pool is ready first.
+      - name: Run Terraform Environment Pipeline
+        uses: Azure/pipelines@v1
+        with:
+          azure-devops-project-url: ${{ env.ado_project_url }}  # e.g. https://dev.azure.com/<my-org>/<my-project>
+          azure-pipeline-name: ${{ secrets.ENVIRONMENT_PIPELINE_NAME }}
+          azure-devops-token: '${{ secrets.ADO_PAT }}'
+
+      - name: Run Terraform Environment Destroy Pipeline
+        uses: Azure/pipelines@v1
+        if: always()
+        with:
+          azure-devops-project-url: ${{ env.ado_project_url }}  # e.g. https://dev.azure.com/<my-org>/<my-project>
+          azure-pipeline-name: ${{ secrets.ENVIRONMENT_DESTROY_PIPELINE_NAME }}
+          azure-devops-token: '${{ secrets.ADO_PAT }}'
+
+      # TODO: Check if the pipeline actually ran successfully
+      - name: Terraform Bootstrap Destroy
+        id: terraform_bootstrap_destroy
+        if: always()
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_ACCESS_KEY: ${{ secrets.BOOTSTRAP_TF_STATE_STORAGE_ACCOUNT_KEY }}
+        run: |
+          az login --service-principal -u "${{ secrets.ARM_CLIENT_ID }}" -p "${{ secrets.ARM_CLIENT_SECRET }}" --tenant "${{ secrets.ARM_TENANT_ID }}"
+
+          CONTAINER_NAME="$prefix-$environment-tfstate"
+          RESOURCE_GROUP_NAME="$prefix-$environment-ado-bootstrap-omop-rg"
+          VMSS_NAME="$prefix-$environment-ado-build-windows-vmss-agent"
+
+          echo "***** Remove Azure DevOps Pipeline Agent Extension *****"
+          EXTENSION_NAME='Microsoft.Azure.DevOps.Pipelines.Agent'
+          FOUND_EXTENSION_NAME=$(az vmss extension list -g "$RESOURCE_GROUP_NAME" --vmss-name "$VMSS_NAME" --query "[?name=='$EXTENSION_NAME']" | jq -r ".[].name")
+
+          if [ -z "$FOUND_EXTENSION_NAME" ]
+          then
+              echo "Unable to find the extension $EXTENSION_NAME on VMSS $VMSS_NAME"
+          else
+              echo "Able to find the extension $EXTENSION_NAME on VMSS $VMSS_NAME"
+              az vmss extension delete --name "$EXTENSION_NAME" --resource-group "$RESOURCE_GROUP_NAME" --vmss-name "$VMSS_NAME"
+          fi
+
+          # comment out prevent_destroy
+          cd infra/terraform/bootstrap
+          sed -e '/prevent_destroy/s/^/#/g' -i azure_devops.tf
+
+          echo "***** Destroying: infra/terraform/bootstrap *****"
+          # run terraform destroy
+          terraform apply -auto-approve -destroy \
+            -var "client_object_id=${{ secrets.ARM_CLIENT_OBJECT_ID }}" \
+            -var "prefix=$prefix" \
+            -var "environment=$environment" \
+            -var "omop_password=${{ secrets.OMOP_PASSWORD }}" \
+            -var "ado_pat=${{ secrets.ADO_PAT }}" \
+            -var "admin_user_jumpbox=${{ secrets.ADMIN_USER_JUMPBOX }}" \
+            -var "admin_password_jumpbox=${{ secrets.ADMIN_PASSWORD_JUMPBOX }}" \
+            -var "admin_user=${{ secrets.ADMIN_USER }}" \
+            -var "admin_password=${{ secrets.ADMIN_PASSWORD }}"
+          cd -
+
+          echo "***** Clean up Bootstrap Azure Storage Container *****"
+          # delete bootstrap container
+          az storage container delete --name "$CONTAINER_NAME" --account-name ${{ secrets.BOOTSTRAP_TF_STATE_STORAGE_ACCOUNT }}
 
   test_sql:
     needs: lint # job dependency
